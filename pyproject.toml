@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inboxtrue"
+version = "0.1.0"
+description = "Command-line client for the InboxTrue email validation API"
+requires-python = ">=3.10"
+dependencies = ["click>=8.1", "rich>=13", "urllib3>=2"]
+
+[project.scripts]
+inboxtrue = "inboxtrue.main:cli"
+
+# This file sits inside the package directory, so ship only its modules, mapped onto the package name.
+[tool.hatch.build.targets.wheel]
+include = ["*.py"]
+sources = {"" = "inboxtrue"}

@@ -1,0 +1,3 @@
+'''
+InboxTrue command-line client.
+'''
