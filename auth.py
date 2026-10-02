@@ -89,24 +89,35 @@ def token_request(pool: urllib3.PoolManager, token_endpoint: str, fields: dict[s
         body = resp.json()
     except ValueError:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
     if resp.status != 200:
         message = body.get('error_description') or body.get('error') or f'token endpoint HTTP {resp.status}'
         raise AuthError(message, error=body.get('error'), status=resp.status)
+    if not all(isinstance(body.get(k), str) for k in ('access_token', 'refresh_token')) \
+            or not isinstance(body.get('expires_in'), int):
+        raise AuthError('token endpoint returned an unusable response', status=200)
     return body
 
 
 def refresh_failure(error: str | None, status: int | None) -> str:
-    '''How to treat a failed refresh: 'revoked' (drop the session), 'ambiguous' or 'transient' (keep it).
+    '''How to treat a failed refresh: 'revoked' or 'ambiguous' (drop the stored tokens), or 'transient' (keep them).
 
-    'ambiguous' means the server may have rotated the refresh token without us seeing the new one (lost connection, or
-    a proxy timing out on a request the backend completed); presenting the old token again would make the server revoke
-    the whole grant as stolen, so it must not be reused.
+    'ambiguous' means the server may have rotated the refresh token without us seeing the new one (a lost or unusable
+    response, or a server error after the backend may have committed); presenting the old token again would make the
+    server revoke the whole grant as stolen, so it must not be reused. status None stands for a transport failure after
+    the request was sent.
     '''
     if error == 'invalid_grant':
         return 'revoked'
-    if status is None or status in (502, 504):
+    if status is None or status == 200 or status >= 500:
         return 'ambiguous'
     return 'transient'
+
+
+def transport_failure(exc: urllib3.exceptions.HTTPError) -> str:
+    '''Failures to connect (DNS, refused, connect timeout) happen before the request is sent, so nothing rotated.'''
+    return 'transient' if isinstance(exc, urllib3.exceptions.ConnectTimeoutError) else refresh_failure(None, None)
 
 
 def refresh_error(api_url: str, client_id: str, failure: str, detail: str) -> AuthError:
@@ -225,7 +236,7 @@ def access_token(api_url: str, *, force_refresh: bool = False) -> str:
                 'client_id': session['client_id'],
             })
         except urllib3.exceptions.HTTPError as exc:
-            raise refresh_error(api_url, session['client_id'], 'ambiguous', str(exc)) from exc
+            raise refresh_error(api_url, session['client_id'], transport_failure(exc), str(exc)) from exc
         except AuthError as exc:
             failure = refresh_failure(exc.error, exc.status)
             raise refresh_error(api_url, session['client_id'], failure, str(exc)) from exc
@@ -237,8 +248,51 @@ def test_refresh_failure():
     assert refresh_failure('invalid_grant', 400) == 'revoked'
     assert refresh_failure(None, None) == 'ambiguous'
     assert refresh_failure(None, 504) == 'ambiguous'
+    assert refresh_failure(None, 500) == 'ambiguous'
+    assert refresh_failure(None, 503) == 'ambiguous'
+    assert refresh_failure(None, 200) == 'ambiguous'
     assert refresh_failure(None, 429) == 'transient'
-    assert refresh_failure(None, 503) == 'transient'
+    assert refresh_failure('invalid_request', 400) == 'transient'
+
+
+def test_transport_failure():
+    pool = urllib3.PoolManager(timeout=urllib3.Timeout(connect=2, read=2), retries=False)
+    try:
+        pool.request('POST', 'http://127.0.0.1:1/')
+    except urllib3.exceptions.HTTPError as exc:
+        assert transport_failure(exc) == 'transient'
+    assert transport_failure(urllib3.exceptions.ProtocolError('Connection aborted.')) == 'ambiguous'
+    read_pool = urllib3.HTTPConnectionPool('127.0.0.1')
+    assert transport_failure(urllib3.exceptions.ReadTimeoutError(read_pool, '/', 'read timed out')) == 'ambiguous'
+
+
+def test_token_request_bodies():
+    def answer(status: int, body: bytes):
+        server = http.server.HTTPServer(('127.0.0.1', 0), http.server.BaseHTTPRequestHandler)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server.RequestHandlerClass = Handler
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        try:
+            token_request(pool_manager(), f'http://127.0.0.1:{server.server_address[1]}/t', {})
+        except AuthError as exc:
+            return exc.status, str(exc)
+        finally:
+            server.server_close()
+        return None
+
+    assert answer(400, b'[]') == (400, 'token endpoint HTTP 400')
+    assert answer(200, b'<html>ok</html>') == (200, 'token endpoint returned an unusable response')
+    assert answer(200, b'{"access_token": "a"}') == (200, 'token endpoint returned an unusable response')
 
 
 def test_state_matches():

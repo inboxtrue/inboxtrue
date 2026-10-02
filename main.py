@@ -92,7 +92,10 @@ def logout():
               help='Seconds to wait on each mail server.')
 @fmt_option
 def validate(emails: tuple[str, ...], timeout: int, fmt: str):
-    '''Validate email addresses (1 credit each); pass "-" or pipe one address per line on stdin.'''
+    '''Validate email addresses (1 credit per checked address; malformed ones and failed checks are free).
+
+    Pass "-" or pipe one address per line on stdin.
+    '''
     effective = effective_format(fmt)
     rows = []
     try:
