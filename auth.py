@@ -94,8 +94,8 @@ def token_request(pool: urllib3.PoolManager, token_endpoint: str, fields: dict[s
     if resp.status != 200:
         message = body.get('error_description') or body.get('error') or f'token endpoint HTTP {resp.status}'
         raise AuthError(message, error=body.get('error'), status=resp.status)
-    if not all(isinstance(body.get(k), str) for k in ('access_token', 'refresh_token')) \
-            or not isinstance(body.get('expires_in'), int):
+    tokens_present = all(isinstance(body.get(k), str) and body[k] for k in ('access_token', 'refresh_token'))
+    if not tokens_present or not isinstance(body.get('expires_in'), int):
         raise AuthError('token endpoint returned an unusable response', status=200)
     return body
 
@@ -293,6 +293,8 @@ def test_token_request_bodies():
     assert answer(400, b'[]') == (400, 'token endpoint HTTP 400')
     assert answer(200, b'<html>ok</html>') == (200, 'token endpoint returned an unusable response')
     assert answer(200, b'{"access_token": "a"}') == (200, 'token endpoint returned an unusable response')
+    empty_refresh = b'{"access_token": "a", "refresh_token": "", "expires_in": 3600}'
+    assert answer(200, empty_refresh) == (200, 'token endpoint returned an unusable response')
 
 
 def test_state_matches():
