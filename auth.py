@@ -26,7 +26,10 @@ refresh_margin = 60
 
 
 class AuthError(Exception):
-    pass
+    def __init__(self, message: str, *, error: str | None = None, status: int | None = None):
+        super().__init__(message)
+        self.error = error
+        self.status = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,10 +85,42 @@ def register(pool: urllib3.PoolManager, metadata: dict) -> str:
 
 def token_request(pool: urllib3.PoolManager, token_endpoint: str, fields: dict[str, str]) -> dict:
     resp = pool.request_encode_body('POST', token_endpoint, fields=fields, encode_multipart=False)
-    body = resp.json() if resp.data else {}
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
     if resp.status != 200:
-        raise AuthError(body.get('error_description') or body.get('error') or f'token endpoint HTTP {resp.status}')
+        message = body.get('error_description') or body.get('error') or f'token endpoint HTTP {resp.status}'
+        raise AuthError(message, error=body.get('error'), status=resp.status)
     return body
+
+
+def refresh_failure(error: str | None, status: int | None) -> str:
+    '''How to treat a failed refresh: 'revoked' (drop the session), 'ambiguous' or 'transient' (keep it).
+
+    'ambiguous' means the server may have rotated the refresh token without us seeing the new one (lost connection, or
+    a proxy timing out on a request the backend completed); presenting the old token again would make the server revoke
+    the whole grant as stolen, so it must not be reused.
+    '''
+    if error == 'invalid_grant':
+        return 'revoked'
+    if status is None or status in (502, 504):
+        return 'ambiguous'
+    return 'transient'
+
+
+def refresh_error(api_url: str, client_id: str, failure: str, detail: str) -> AuthError:
+    '''Drop the stored tokens unless the failure was transient, and describe what the user should do.'''
+    if failure == 'transient':
+        return AuthError(f'could not refresh the session ({detail}); try again shortly')
+    config.save_session(api_url, {'client_id': client_id})
+    if failure == 'revoked':
+        return AuthError(f'session expired or revoked ({detail}); run inboxtrue login')
+    return AuthError(f'lost contact while refreshing the session ({detail}); run inboxtrue login')
+
+
+def state_matches(received: str, expected: str) -> bool:
+    return secrets.compare_digest(received.encode(), expected.encode())
 
 
 def session_from_tokens(tokens: dict, client_id: str, token_endpoint: str) -> dict:
@@ -151,7 +186,7 @@ def login(api_url: str, *, open_browser: bool, announce) -> dict:
             threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
         callback = wait_for_callback(server)
     params = callback.params
-    if not secrets.compare_digest(params.get('state', ''), state):
+    if not state_matches(params.get('state', ''), state):
         raise AuthError('the browser returned a different login attempt (state mismatch); run inboxtrue login again')
     if 'iss' in params and params['iss'] != metadata['issuer']:
         raise AuthError(f'response came from issuer {params["iss"]!r}, expected {metadata["issuer"]!r}')
@@ -179,7 +214,9 @@ def access_token(api_url: str, *, force_refresh: bool = False) -> str:
         return session['access_token']
     with config.credentials_lock():
         current = config.load_session(api_url)
-        if current.get('refresh_token') != session['refresh_token']:
+        if not current.get('refresh_token'):
+            raise AuthError('not logged in; run inboxtrue login (or set INBOXTRUE_API_KEY)')
+        if current['refresh_token'] != session['refresh_token']:
             return current['access_token']
         try:
             tokens = token_request(pool_manager(), session['token_endpoint'], {
@@ -187,11 +224,27 @@ def access_token(api_url: str, *, force_refresh: bool = False) -> str:
                 'refresh_token': session['refresh_token'],
                 'client_id': session['client_id'],
             })
+        except urllib3.exceptions.HTTPError as exc:
+            raise refresh_error(api_url, session['client_id'], 'ambiguous', str(exc)) from exc
         except AuthError as exc:
-            config.save_session(api_url, {'client_id': session['client_id']})
-            raise AuthError(f'session expired or revoked ({exc}); run inboxtrue login') from exc
+            failure = refresh_failure(exc.error, exc.status)
+            raise refresh_error(api_url, session['client_id'], failure, str(exc)) from exc
         config.save_session(api_url, session_from_tokens(tokens, session['client_id'], session['token_endpoint']))
     return tokens['access_token']
+
+
+def test_refresh_failure():
+    assert refresh_failure('invalid_grant', 400) == 'revoked'
+    assert refresh_failure(None, None) == 'ambiguous'
+    assert refresh_failure(None, 504) == 'ambiguous'
+    assert refresh_failure(None, 429) == 'transient'
+    assert refresh_failure(None, 503) == 'transient'
+
+
+def test_state_matches():
+    assert state_matches('abc', 'abc')
+    assert not state_matches('abd', 'abc')
+    assert not state_matches('caf\u00e9', 'abc')
 
 
 def test_new_pkce():

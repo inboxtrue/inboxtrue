@@ -137,13 +137,13 @@ def config_group():
 
 
 @config_group.command('get')
-@click.argument('key', type=click.Choice(list(config.config_keys)))
+@click.argument('key', type=click.Choice([key for key, _ in config.config_keys]))
 def config_get(key: str):
     console.print(config.read_json(config.config_path()).get(key, ''))
 
 
 @config_group.command('set')
-@click.argument('key', type=click.Choice(list(config.config_keys)))
+@click.argument('key', type=click.Choice([key for key, _ in config.config_keys]))
 @click.argument('value')
 def config_set(key: str, value: str):
     data = {**config.read_json(config.config_path()), key: value.rstrip('/')}

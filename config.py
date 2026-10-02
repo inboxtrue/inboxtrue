@@ -6,7 +6,7 @@ import tempfile
 from collections.abc import Iterator
 
 default_api_url = 'https://api.inboxtrue.com'
-config_keys = {'api_url': 'API origin, eg https://api.inboxtrue.com (env INBOXTRUE_API_URL wins)'}
+config_keys = (('api_url', 'API origin, eg https://api.inboxtrue.com (env INBOXTRUE_API_URL wins)'),)
 
 
 def config_dir() -> str:
