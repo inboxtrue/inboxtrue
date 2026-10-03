@@ -1,9 +1,15 @@
 import contextlib
-import fcntl
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Iterator
+from typing import IO
+
+if sys.platform == 'win32':
+    import msvcrt  # pylint: disable=import-error
+else:
+    import fcntl
 
 default_api_url = 'https://api.inboxtrue.com'
 config_keys = (('api_url', 'API origin, eg https://api.inboxtrue.com (env INBOXTRUE_API_URL wins)'),)
@@ -58,11 +64,30 @@ def credentials_lock() -> Iterator[None]:
     '''
     os.makedirs(config_dir(), mode=0o700, exist_ok=True)
     with open(os.path.join(config_dir(), '.credentials.lock'), 'w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_file(lock)
         try:
             yield
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            unlock_file(lock)
+
+
+if sys.platform == 'win32':
+    def lock_file(f: IO):
+        # LK_LOCK gives up with OSError after about 10 seconds, so keep waiting like flock does.
+        while True:
+            with contextlib.suppress(OSError):
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                return
+
+    def unlock_file(f: IO):
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    def lock_file(f: IO):
+        fcntl.flock(f, fcntl.LOCK_EX)
+
+    def unlock_file(f: IO):
+        fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def api_url() -> str:
@@ -94,7 +119,8 @@ def test_credentials_are_private_and_keyed_by_api_url():
         try:
             save_session('https://api.inboxtrue.com', {'access_token': 'a'})
             save_session('http://localhost:3080', {'access_token': 'b'})
-            assert os.stat(credentials_path()).st_mode & 0o777 == 0o600
+            if sys.platform != 'win32':
+                assert os.stat(credentials_path()).st_mode & 0o777 == 0o600
             assert load_session('https://api.inboxtrue.com') == {'access_token': 'a'}
             save_session('https://api.inboxtrue.com', None)
             assert load_session('https://api.inboxtrue.com') == {}
