@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import json
 import os
 import sys
@@ -72,12 +73,19 @@ def credentials_lock() -> Iterator[None]:
 
 
 if sys.platform == 'win32':
+    def try_lock_file(f: IO) -> bool:
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError as exc:
+            if exc.errno != errno.EDEADLOCK:
+                raise
+            return False
+        return True
+
     def lock_file(f: IO):
-        # LK_LOCK gives up with OSError after about 10 seconds, so keep waiting like flock does.
-        while True:
-            with contextlib.suppress(OSError):
-                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-                return
+        # LK_LOCK gives up with EDEADLOCK after about 10 seconds, so keep waiting like flock does.
+        while not try_lock_file(f):
+            pass
 
     def unlock_file(f: IO):
         f.seek(0)
