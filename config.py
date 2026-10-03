@@ -40,7 +40,11 @@ def read_json(path: str) -> dict:
 
 
 def write_json_private(path: str, data: dict):
-    '''Atomically replace path with data, readable only by the current user (it may hold tokens).'''
+    '''Atomically replace path with data, readable only by the current user (it may hold tokens).
+
+    On Windows chmod cannot restrict access, so privacy rests on the config directory's ACL, which is user-only by
+    default under the user profile.
+    '''
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.tmp-')
     replaced = False
