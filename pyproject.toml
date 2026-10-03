@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = ["click>=8.1", "rich>=13", "urllib3>=2"]
 
 [project.scripts]
-inboxtrue = "inboxtrue.main:cli"
+inboxtrue = "inboxtrue.__main__:cli"
 
 # This file sits inside the package directory, so ship only its modules, mapped onto the package name.
 [tool.hatch.build.targets.wheel]
