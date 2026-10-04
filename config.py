@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from typing import IO
 
@@ -53,7 +54,7 @@ def write_json_private(path: str, data: dict):
             json.dump(data, f, indent=2)
             f.write('\n')
         os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
         replaced = True
     finally:
         if not replaced:
@@ -94,12 +95,25 @@ if sys.platform == 'win32':
     def unlock_file(f: IO):
         f.seek(0)
         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+
+    def replace_file(src: str, dst: str):
+        # Replacing fails with access denied while another process holds dst open, eg a concurrent CLI reading
+        # credentials outside the lock, antivirus, or the search indexer.
+        for _ in range(20):
+            with contextlib.suppress(PermissionError):
+                os.replace(src, dst)
+                return
+            time.sleep(0.05)
+        os.replace(src, dst)
 else:
     def lock_file(f: IO):
         fcntl.flock(f, fcntl.LOCK_EX)
 
     def unlock_file(f: IO):
         fcntl.flock(f, fcntl.LOCK_UN)
+
+    def replace_file(src: str, dst: str):
+        os.replace(src, dst)
 
 
 def api_url() -> str:
