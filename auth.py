@@ -1,7 +1,8 @@
 '''
 OAuth for the CLI: discover the authorization server from the API's RFC 9728 metadata, register once as a public
-client (RFC 7591), log in through the browser with a loopback redirect and PKCE (RFC 8252, RFC 7636), and keep the
-access token fresh with rotating refresh tokens.
+client (RFC 7591), log in through the browser with a loopback redirect and PKCE (RFC 8252, RFC 7636), or by pasting a
+code the dashboard shows when the browser cannot reach this machine, and keep the access token fresh with rotating
+refresh tokens.
 '''
 
 import base64
@@ -21,6 +22,7 @@ from inboxtrue import config
 
 client_name = 'InboxTrue CLI'
 loopback_redirect = 'http://127.0.0.1/callback'
+code_page_path = '/oauth/code'
 login_timeout = 300
 refresh_margin = 60
 
@@ -70,10 +72,10 @@ def discover(pool: urllib3.PoolManager, api_url: str) -> dict:
     return metadata
 
 
-def register(pool: urllib3.PoolManager, metadata: dict) -> str:
+def register(pool: urllib3.PoolManager, metadata: dict, redirect_uris: list[str]) -> str:
     resp = pool.request('POST', metadata['registration_endpoint'], json={
         'client_name': client_name,
-        'redirect_uris': [loopback_redirect],
+        'redirect_uris': redirect_uris,
         'grant_types': ['authorization_code', 'refresh_token'],
         'response_types': ['code'],
         'token_endpoint_auth_method': 'none',
@@ -81,6 +83,26 @@ def register(pool: urllib3.PoolManager, metadata: dict) -> str:
     if resp.status != 201:
         raise AuthError(f'client registration failed: HTTP {resp.status} {resp.data.decode(errors="replace")}')
     return resp.json()['client_id']
+
+
+def client_fields(session: dict) -> dict:
+    '''The client registration part of a session, kept across logouts so later logins reuse the same grant.'''
+    return {k: session[k] for k in ('client_id', 'client_redirect_uris') if k in session}
+
+
+def reusable_client(session: dict, redirect_uri: str) -> dict | None:
+    # Sessions saved before the code page existed registered only the loopback redirect.
+    if 'client_id' in session and redirect_uri in session.get('client_redirect_uris', [loopback_redirect]):
+        return client_fields(session)
+    return None
+
+
+def login_client(pool: urllib3.PoolManager, metadata: dict, session: dict, redirect_uri: str) -> dict:
+    client = reusable_client(session, redirect_uri)
+    if client is not None:
+        return client
+    redirect_uris = [loopback_redirect, metadata['issuer'] + code_page_path]
+    return {'client_id': register(pool, metadata, redirect_uris), 'client_redirect_uris': redirect_uris}
 
 
 def token_request(pool: urllib3.PoolManager, token_endpoint: str, fields: dict[str, str]) -> dict:
@@ -120,11 +142,11 @@ def transport_failure(exc: urllib3.exceptions.HTTPError) -> str:
     return 'transient' if isinstance(exc, urllib3.exceptions.ConnectTimeoutError) else refresh_failure(None, None)
 
 
-def refresh_error(api_url: str, client_id: str, failure: str, detail: str) -> AuthError:
+def refresh_error(api_url: str, client: dict, failure: str, detail: str) -> AuthError:
     '''Drop the stored tokens unless the failure was transient, and describe what the user should do.'''
     if failure == 'transient':
         return AuthError(f'could not refresh the session ({detail}); try again shortly')
-    config.save_session(api_url, {'client_id': client_id})
+    config.save_session(api_url, client)
     if failure == 'revoked':
         return AuthError(f'session expired or revoked ({detail}); run inboxtrue login')
     return AuthError(f'lost contact while refreshing the session ({detail}); run inboxtrue login')
@@ -134,9 +156,9 @@ def state_matches(received: str, expected: str) -> bool:
     return secrets.compare_digest(received.encode(), expected.encode())
 
 
-def session_from_tokens(tokens: dict, client_id: str, token_endpoint: str) -> dict:
+def session_from_tokens(tokens: dict, client: dict, token_endpoint: str) -> dict:
     return {
-        'client_id': client_id,
+        **client,
         'token_endpoint': token_endpoint,
         'access_token': tokens['access_token'],
         'refresh_token': tokens['refresh_token'],
@@ -168,52 +190,89 @@ def wait_for_callback(server: http.server.HTTPServer) -> Callback:
     deadline = time.monotonic() + login_timeout
     while not received:
         if time.monotonic() > deadline:
-            raise AuthError(f'no answer from the browser within {login_timeout}s')
+            raise AuthError(f'no answer from the browser within {login_timeout}s; if it runs on another machine (eg '
+                            'this terminal is in Docker or over SSH), run inboxtrue login --code')
         server.handle_request()
     return received[0]
+
+
+def authorize_url(metadata: dict, api_url: str, client_id: str, redirect_uri: str, pkce: Pkce, state: str) -> str:
+    return metadata['authorization_endpoint'] + '?' + urllib.parse.urlencode({
+        'response_type': 'code',
+        'client_id': client_id,
+        'redirect_uri': redirect_uri,
+        'code_challenge': pkce.challenge,
+        'code_challenge_method': 'S256',
+        'state': state,
+        'scope': ' '.join(metadata.get('scopes_supported', [])),
+        'resource': api_url,
+    })
+
+
+def pasted_params(text: str) -> dict[str, str]:
+    '''The code page shows "code#state"; read it back as the redirect's query parameters.'''
+    code, _, state = text.strip().partition('#')
+    return {'code': code, 'state': state}
+
+
+def finish_login(
+    pool: urllib3.PoolManager,
+    api_url: str,
+    metadata: dict,
+    client: dict,
+    redirect_uri: str,
+    pkce: Pkce,
+    state: str,
+    params: dict[str, str],
+) -> dict:
+    if not state_matches(params.get('state', ''), state):
+        raise AuthError('the code belongs to a different login attempt (state mismatch); run inboxtrue login again')
+    if 'iss' in params and params['iss'] != metadata['issuer']:
+        raise AuthError(f'response came from issuer {params["iss"]!r}, expected {metadata["issuer"]!r}')
+    if 'error' in params:
+        raise AuthError(params.get('error_description') or params['error'])
+    if not params.get('code'):
+        raise AuthError('the login returned no code; run inboxtrue login again')
+    tokens = token_request(pool, metadata['token_endpoint'], {
+        'grant_type': 'authorization_code',
+        'code': params['code'],
+        'redirect_uri': redirect_uri,
+        'client_id': client['client_id'],
+        'code_verifier': pkce.verifier,
+    })
+    new_session = session_from_tokens(tokens, client, metadata['token_endpoint'])
+    with config.credentials_lock():
+        config.save_session(api_url, new_session)
+    return new_session
 
 
 def login(api_url: str, *, open_browser: bool, announce) -> dict:
     pool = pool_manager()
     metadata = discover(pool, api_url)
-    session = config.load_session(api_url)
-    client_id = session.get('client_id') or register(pool, metadata)
+    client = login_client(pool, metadata, config.load_session(api_url), loopback_redirect)
     pkce = new_pkce()
     state = secrets.token_urlsafe(24)
     with http.server.HTTPServer(('127.0.0.1', 0), http.server.BaseHTTPRequestHandler) as server:
         redirect_uri = f'http://127.0.0.1:{server.server_address[1]}/callback'
-        url = metadata['authorization_endpoint'] + '?' + urllib.parse.urlencode({
-            'response_type': 'code',
-            'client_id': client_id,
-            'redirect_uri': redirect_uri,
-            'code_challenge': pkce.challenge,
-            'code_challenge_method': 'S256',
-            'state': state,
-            'scope': ' '.join(metadata.get('scopes_supported', [])),
-            'resource': api_url,
-        })
+        url = authorize_url(metadata, api_url, client['client_id'], redirect_uri, pkce, state)
         announce(url)
         if open_browser:
             threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
         callback = wait_for_callback(server)
-    params = callback.params
-    if not state_matches(params.get('state', ''), state):
-        raise AuthError('the browser returned a different login attempt (state mismatch); run inboxtrue login again')
-    if 'iss' in params and params['iss'] != metadata['issuer']:
-        raise AuthError(f'response came from issuer {params["iss"]!r}, expected {metadata["issuer"]!r}')
-    if 'error' in params:
-        raise AuthError(params.get('error_description') or params['error'])
-    tokens = token_request(pool, metadata['token_endpoint'], {
-        'grant_type': 'authorization_code',
-        'code': params['code'],
-        'redirect_uri': redirect_uri,
-        'client_id': client_id,
-        'code_verifier': pkce.verifier,
-    })
-    new_session = session_from_tokens(tokens, client_id, metadata['token_endpoint'])
-    with config.credentials_lock():
-        config.save_session(api_url, new_session)
-    return new_session
+    return finish_login(pool, api_url, metadata, client, redirect_uri, pkce, state, callback.params)
+
+
+def login_with_code(api_url: str, *, announce, read_code) -> dict:
+    '''Log in from a browser on any machine, which shows a code to paste here instead of redirecting to loopback.'''
+    pool = pool_manager()
+    metadata = discover(pool, api_url)
+    redirect_uri = metadata['issuer'] + code_page_path
+    client = login_client(pool, metadata, config.load_session(api_url), redirect_uri)
+    pkce = new_pkce()
+    state = secrets.token_urlsafe(24)
+    announce(authorize_url(metadata, api_url, client['client_id'], redirect_uri, pkce, state))
+    params = pasted_params(read_code())
+    return finish_login(pool, api_url, metadata, client, redirect_uri, pkce, state, params)
 
 
 def access_token(api_url: str, *, force_refresh: bool = False) -> str:
@@ -236,11 +295,11 @@ def access_token(api_url: str, *, force_refresh: bool = False) -> str:
                 'client_id': session['client_id'],
             })
         except urllib3.exceptions.HTTPError as exc:
-            raise refresh_error(api_url, session['client_id'], transport_failure(exc), str(exc)) from exc
+            raise refresh_error(api_url, client_fields(session), transport_failure(exc), str(exc)) from exc
         except AuthError as exc:
             failure = refresh_failure(exc.error, exc.status)
-            raise refresh_error(api_url, session['client_id'], failure, str(exc)) from exc
-        config.save_session(api_url, session_from_tokens(tokens, session['client_id'], session['token_endpoint']))
+            raise refresh_error(api_url, client_fields(session), failure, str(exc)) from exc
+        config.save_session(api_url, session_from_tokens(tokens, client_fields(session), session['token_endpoint']))
     return tokens['access_token']
 
 
@@ -326,8 +385,25 @@ def test_wait_for_callback():
 
 
 def test_session_from_tokens():
+    client = {'client_id': 'cid', 'client_redirect_uris': [loopback_redirect]}
     session = session_from_tokens(
-        {'access_token': 'a', 'refresh_token': 'r', 'expires_in': 3600}, 'cid', 'https://x/b/oauth/token')
+        {'access_token': 'a', 'refresh_token': 'r', 'expires_in': 3600}, client, 'https://x/b/oauth/token')
     assert session['access_token'] == 'a'
+    assert client_fields(session) == client
     assert 3500 < session['expires_at'] - time.time() <= 3600
     assert json.dumps(session)
+
+
+def test_reusable_client():
+    code_page = 'https://inboxtrue.com' + code_page_path
+    legacy = {'client_id': 'old', 'access_token': 'a'}
+    assert reusable_client(legacy, loopback_redirect) == {'client_id': 'old'}
+    assert reusable_client(legacy, code_page) is None
+    current = {'client_id': 'new', 'client_redirect_uris': [loopback_redirect, code_page], 'refresh_token': 'r'}
+    assert reusable_client(current, code_page) == client_fields(current)
+    assert reusable_client({}, loopback_redirect) is None
+
+
+def test_pasted_params():
+    assert pasted_params('  c0de#st4te\n') == {'code': 'c0de', 'state': 'st4te'}
+    assert pasted_params('c0de') == {'code': 'c0de', 'state': ''}
