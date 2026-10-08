@@ -108,7 +108,9 @@ def logout():
               help='Seconds to wait on each mail server.')
 @fmt_option
 def validate(emails: tuple[str, ...], timeout: int, fmt: str):
-    '''Validate email addresses (1 credit per checked address; malformed ones and failed checks are free).
+    '''Validate email addresses (1 paid credit per checked address; malformed ones and failed checks are free).
+
+    With no paid credits left, validations are free under a much lower rate limit.
 
     Pass "-" or pipe one address per line on stdin.
     '''
