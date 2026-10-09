@@ -21,6 +21,8 @@ import urllib3
 from inboxtrue import config
 
 client_name = 'InboxTrue CLI'
+# The commands that run on an OAuth session; bulk ones need an API key.
+scopes = 'email.validate credits.read'
 loopback_redirect = 'http://127.0.0.1/callback'
 code_page_path = '/oauth/code'
 login_timeout = 300
@@ -204,7 +206,7 @@ def authorize_url(metadata: dict, api_url: str, client_id: str, redirect_uri: st
         'code_challenge': pkce.challenge,
         'code_challenge_method': 'S256',
         'state': state,
-        'scope': ' '.join(metadata.get('scopes_supported', [])),
+        'scope': scopes,
         'resource': api_url,
     })
 
