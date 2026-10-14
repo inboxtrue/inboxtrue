@@ -19,6 +19,8 @@ def error_message(resp: urllib3.BaseHTTPResponse) -> str:
         body = resp.json()
     except ValueError:
         return f'HTTP {resp.status}'
+    if not isinstance(body, dict):
+        return f'HTTP {resp.status}'
     return body.get('msg') or body.get('error_description') or body.get('error') or f'HTTP {resp.status}'
 
 
@@ -36,7 +38,13 @@ def api_get(path: str, **params: object) -> dict:
         resp = pool.request('GET', f'{url}{path}', fields=fields, headers={'Authorization': f'Bearer {token}'})
     if resp.status != 200:
         raise ApiError(resp.status, error_message(resp))
-    return resp.json()
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise ApiError(resp.status, 'API returned an unusable response; try again shortly') from exc
+    if not isinstance(body, dict):
+        raise ApiError(resp.status, 'API returned an unusable response; try again shortly')
+    return body
 
 
 def validate(email: str, timeout: int) -> dict:

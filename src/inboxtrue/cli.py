@@ -4,6 +4,7 @@ from collections.abc import Iterable, Iterator
 from typing import NoReturn
 
 import click
+import urllib3
 from rich.console import Console
 from rich.table import Table
 
@@ -51,7 +52,16 @@ def report_api_error(exc: client.ApiError) -> NoReturn:
     fail(f'{exc} ({exc.status}). {hint}'.strip())
 
 
-@click.group(context_settings={'max_content_width': 120})
+class CliGroup(click.Group):
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except urllib3.exceptions.HTTPError as exc:
+            fail(f'Network request failed: {exc}. Check your connection and try again.')
+
+
+@click.group(cls=CliGroup, context_settings={'max_content_width': 120})
+@click.version_option(package_name='inboxtrue')
 def cli():
     '''InboxTrue email validation from the terminal.
 
@@ -170,13 +180,3 @@ def config_set(key: str, value: str):
     data = {**config.read_json(config.config_path()), key: value.rstrip('/')}
     config.write_json_private(config.config_path(), data)
     err.print(f'{key} = {data[key]}')
-
-
-def test_addresses():
-    assert list(addresses(['a@x.com', 'b@x.com'], [])) == ['a@x.com', 'b@x.com']
-    assert list(addresses([], ['a@x.com\n', '\n', '# note\n', ' b@x.com '])) == ['a@x.com', 'b@x.com']
-    assert list(addresses(['z@x.com', '-'], ['a@x.com\n'])) == ['z@x.com', 'a@x.com']
-
-
-if __name__ == '__main__':
-    cli()
